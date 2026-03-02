@@ -12,19 +12,20 @@ import modal
 # Create the Modal app
 app = modal.App("instantplus")
 
-# InstantSplat++ requires Python 3.10, PyTorch 2.1.2 and CUDA 12.1.
-# We start from an NVIDIA CUDA dev image, install PyTorch + CUDA 12.1,
-# clone InstantSplat++, build CUDA submodules, and download the MASt3R checkpoint.
+# InstantSplat++ requires Python 3.10, PyTorch 2.1.2 and CUDA.
+# We use the official PyTorch image (matching InstantSplat++'s own Dockerfile)
+# which has PyTorch, CUDA dev tools, and the correct compiler already set up.
 image = (
     modal.Image.from_registry(
-        "nvidia/cuda:12.1.1-devel-ubuntu22.04",
-        add_python="3.10",
+        "pytorch/pytorch:2.1.2-cuda12.1-cudnn8-devel",
+        add_python=None,
     )
     .env(
         {
             "TORCH_CUDA_ARCH_LIST": "8.0;8.6;9.0",
             "DEBIAN_FRONTEND": "noninteractive",
             "FORCE_CUDA": "1",
+            "MAX_JOBS": "4",
         }
     )
     .run_commands(
@@ -34,11 +35,9 @@ image = (
         "build-essential ninja-build cmake "
         "&& rm -rf /var/lib/apt/lists/*",
 
-        # ── Phase 1: Install PyTorch 2.1.2 + CUDA 12.1
-        "pip install --no-cache-dir "
-        "torch==2.1.2+cu121 torchvision==0.16.2+cu121 "
-        "--index-url https://download.pytorch.org/whl/cu121",
-        "pip install -U pip",
+        # ── Phase 1: Ensure pip, wheel and setuptools are compatible
+        # Pin setuptools < 75 to keep pkg_resources (needed by torch cpp_extension)
+        "pip install --no-cache-dir -U pip wheel 'setuptools<75'",
 
         # ── Phase 2: Clone InstantSplat++ (recursive for submodules)
         "git clone --recursive https://github.com/phai-lab/InstantSplatPP.git /opt/instantsplat",
@@ -62,7 +61,10 @@ image = (
         "cd /opt/instantsplat && pip install -v --no-build-isolation ./submodules/fused-ssim",
 
         # ── Phase 7: Compile RoPE CUDA kernels (CroCo v2)
-        "cd /opt/instantsplat/croco/models/curope && python setup.py build_ext --inplace",
+        # The curope module is inside the MASt3R → DUSt3R → CroCo submodule chain
+        "bash -c 'CUROPE=$(find /opt/instantsplat -name \"curope\" -path \"*/croco/models/curope\" -type d | head -1); "
+        "if [ -n \"$CUROPE\" ]; then cd \"$CUROPE\" && python setup.py build_ext --inplace; "
+        "else echo \"WARNING: curope not found, skipping RoPE CUDA kernel build\"; fi'",
 
         # ── Phase 8: Install plyfile for post-processing
         "pip install --no-cache-dir plyfile",
