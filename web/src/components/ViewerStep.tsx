@@ -46,6 +46,13 @@ type BlendMode =
 type ColorFilter = "none" | "warm" | "cool" | "vintage" | "noir" | "vivid" | "muted" | "cinematic" | "sunset" | "forest" | "ocean" | "sepia" | "cyberpunk" | "dreamy" | "gameboy" | "retro" | "neon" | "pastel" | "monochrome" | "polaroid" | "lomo" | "hdr";
 
 interface Settings {
+  // Splat Controls (real GaussianSplats3D API)
+  splatScale: number;        // splatMesh.setSplatScale() — per-splat rendering scale
+  focalAdjustment: number;   // viewer.focalAdjustment — focal length multiplier
+  maxSplatSize: number;      // viewer.maxScreenSpaceSplatSize
+  sceneOpacity: number;      // scene opacity via enableOptionalEffects uniform
+  pointCloudMode: boolean;   // splatMesh.setPointCloudModeEnabled()
+  splatThreshold: number;    // splatAlphaRemovalThreshold (load-time)
   // Camera
   fov: number;
   nearClip: number;
@@ -78,14 +85,6 @@ interface Settings {
   scanlines: number;
   noise: number;
   glitch: number;
-  // Material
-  splatOpacity: number;
-  splatSize: number;
-  // Splat Controls
-  splatDensity: number;
-  splatThreshold: number;
-  splatRenderDistance: number;
-  splatQuality: number;
   // Atmosphere
   fogEnabled: boolean;
   fogDensity: number;
@@ -97,10 +96,19 @@ interface Settings {
 }
 
 const DEFAULT_SETTINGS: Settings = {
+  // Splat Controls (real GS3D API)
+  splatScale: 1.0,
+  focalAdjustment: 1.0,
+  maxSplatSize: 1024,
+  sceneOpacity: 1.0,
+  pointCloudMode: false,
+  splatThreshold: 1,
+  // Camera
   fov: 60,
   nearClip: 0.1,
   farClip: 1000,
   exposure: 1.0,
+  // Color Grading
   brightness: 1.0,
   contrast: 1.0,
   saturation: 1.0,
@@ -112,6 +120,7 @@ const DEFAULT_SETTINGS: Settings = {
   highlights: 0,
   colorFilter: "none",
   blendMode: "normal",
+  // Post FX
   grain: 0,
   bloom: 0,
   bloomThreshold: 0.8,
@@ -125,15 +134,11 @@ const DEFAULT_SETTINGS: Settings = {
   scanlines: 0,
   noise: 0,
   glitch: 0,
-  splatOpacity: 1.0,
-  splatSize: 1.0,
-  splatDensity: 1.0,
-  splatThreshold: 20,
-  splatRenderDistance: 1.0,
-  splatQuality: 1.0,
+  // Atmosphere
   fogEnabled: false,
   fogDensity: 0.5,
   fogColor: "#808080",
+  // Background
   bgColor: "#f5f5f5",
   autoEnhance: false,
 };
@@ -150,6 +155,8 @@ const ENHANCED_SETTINGS: Partial<Settings> = {
   bloomThreshold: 0.7,
   vignette: 0.2,
   exposure: 1.05,
+  splatScale: 1.1,
+  focalAdjustment: 1.1,
 };
 
 const BLEND_MODES: { value: BlendMode; label: string }[] = [
@@ -539,7 +546,6 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
   useEffect(() => {
     if (canvasRef.current) {
       canvasRef.current.style.filter = getCSSFilters();
-      canvasRef.current.style.opacity = String(settings.splatOpacity);
       canvasRef.current.style.mixBlendMode = settings.blendMode;
       
       // Pixelate effect
@@ -551,7 +557,7 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
         canvasRef.current.style.transform = "scale(1)";
       }
     }
-  }, [getCSSFilters, settings.splatOpacity, settings.blendMode, settings.pixelate]);
+  }, [getCSSFilters, settings.blendMode, settings.pixelate]);
 
   // Camera settings — the GS3D viewer exposes a Three.js PerspectiveCamera
   useEffect(() => {
@@ -565,23 +571,40 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
     }
   }, [settings.fov, settings.nearClip, settings.farClip]);
 
-  // Splat controls — apply via the real GS3D API where possible
+  // Splat controls — wired to the real GaussianSplats3D Viewer API
   useEffect(() => {
     const viewer = viewerInstanceRef.current;
-    
-    // Apply scene scale via splatMesh (Three.js Object3D)
-    if (viewer?.splatMesh?.scale) {
-      const scale = settings.splatSize;
-      viewer.splatMesh.scale.set(scale, scale, scale);
+    if (!viewer) return;
+
+    // (1) Splat Scale — via splatMesh.setSplatScale() which sets a shader uniform
+    //     This is the '=' / '-' keyboard shortcut internally
+    if (viewer.splatMesh?.setSplatScale) {
+      viewer.splatMesh.setSplatScale(settings.splatScale);
     }
-    
-    // Apply opacity via CSS (the GS3D library doesn't expose per-splat opacity at runtime
-    // unless enableOptionalEffects is used; CSS opacity is the reliable fallback)
-    if (canvasRef.current) {
-      const effectiveOpacity = settings.splatOpacity * Math.min(settings.splatDensity, 1);
-      canvasRef.current.style.opacity = String(Math.min(effectiveOpacity, 1));
+
+    // (2) Focal Adjustment — affects apparent splat size via focal length multiplier
+    viewer.focalAdjustment = settings.focalAdjustment;
+
+    // (3) Max Screen-Space Splat Size — caps how large a splat can appear on screen
+    viewer.maxScreenSpaceSplatSize = settings.maxSplatSize;
+
+    // (4) Scene Opacity — via enableOptionalEffects uniform
+    if (viewer.splatMesh?.material?.uniforms?.sceneOpacity) {
+      const opacityArray = viewer.splatMesh.material.uniforms.sceneOpacity.value;
+      if (opacityArray && opacityArray.length > 0) {
+        opacityArray[0] = settings.sceneOpacity;
+        viewer.splatMesh.material.uniformsNeedUpdate = true;
+      }
     }
-  }, [settings.splatSize, settings.splatDensity, settings.splatOpacity]);
+
+    // (5) Point Cloud Mode — renders splats as small dots
+    if (viewer.splatMesh?.setPointCloudModeEnabled) {
+      viewer.splatMesh.setPointCloudModeEnabled(settings.pointCloudMode);
+    }
+
+    // Force a re-render after property changes
+    viewer.forceRenderNextFrame?.();
+  }, [settings.splatScale, settings.focalAdjustment, settings.maxSplatSize, settings.sceneOpacity, settings.pointCloudMode]);
 
   // Background color
   useEffect(() => {
@@ -1071,6 +1094,26 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
               </div>
 
               <div className="flex-1 overflow-y-auto min-h-0">
+                <Section title="Splat Controls" defaultOpen={true}>
+                  <div className="space-y-1">
+                    <Slider label="Splat Scale" value={settings.splatScale} min={0.05} max={3} step={0.05} onChange={(v) => updateSetting("splatScale", v)} format={(v) => `${v.toFixed(2)}x`} />
+                    <p className="text-[10px] text-muted -mt-1">Per-splat rendering size (shader uniform)</p>
+                  </div>
+                  <div className="space-y-1">
+                    <Slider label="Focal Adjustment" value={settings.focalAdjustment} min={0.2} max={3} step={0.05} onChange={(v) => updateSetting("focalAdjustment", v)} format={(v) => `${v.toFixed(2)}x`} />
+                    <p className="text-[10px] text-muted -mt-1">Focal length multiplier — larger = bigger splats</p>
+                  </div>
+                  <div className="space-y-1">
+                    <Slider label="Max Screen Size" value={settings.maxSplatSize} min={64} max={4096} step={64} onChange={(v) => updateSetting("maxSplatSize", v)} />
+                    <p className="text-[10px] text-muted -mt-1">Max screen-space splat size in pixels</p>
+                  </div>
+                  <div className="space-y-1">
+                    <Slider label="Scene Opacity" value={settings.sceneOpacity} min={0} max={1} step={0.05} onChange={(v) => updateSetting("sceneOpacity", v)} format={(v) => `${Math.round(v * 100)}%`} />
+                    <p className="text-[10px] text-muted -mt-1">Global scene opacity (GPU uniform)</p>
+                  </div>
+                  <Toggle label="Point Cloud Mode" checked={settings.pointCloudMode} onChange={(v) => updateSetting("pointCloudMode", v)} description="Render as small dots instead of splats" />
+                </Section>
+
                 <Section title="Camera" defaultOpen={false}>
                   <Slider label="Field of View" value={settings.fov} min={20} max={120} step={1} onChange={(v) => updateSetting("fov", v)} unit="°" />
                   <Slider label="Near Clip" value={settings.nearClip} min={0.01} max={10} step={0.01} onChange={(v) => updateSetting("nearClip", v)} />
@@ -1129,37 +1172,6 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
                   <Slider label="Scanlines" value={settings.scanlines} min={0} max={1} step={0.05} onChange={(v) => updateSetting("scanlines", v)} format={(v) => `${Math.round(v * 100)}%`} />
                   <Slider label="Pixelate" value={settings.pixelate} min={0} max={1} step={0.05} onChange={(v) => updateSetting("pixelate", v)} format={(v) => `${Math.round(v * 100)}%`} />
                   <Slider label="Glitch" value={settings.glitch} min={0} max={1} step={0.05} onChange={(v) => updateSetting("glitch", v)} format={(v) => `${Math.round(v * 100)}%`} />
-                </Section>
-
-                <Section title="Splat Controls" defaultOpen={true}>
-                  <div className="space-y-1">
-                    <Slider label="Splat Density" value={settings.splatDensity} min={0.1} max={2} step={0.05} onChange={(v) => updateSetting("splatDensity", v)} format={(v) => `${Math.round(v * 100)}%`} />
-                    <p className="text-[10px] text-muted -mt-1">Controls overall visibility and density</p>
-                  </div>
-                  <div className="space-y-1">
-                    <Slider label="Splat Opacity" value={settings.splatOpacity} min={0.1} max={1} step={0.05} onChange={(v) => updateSetting("splatOpacity", v)} format={(v) => `${Math.round(v * 100)}%`} />
-                    <p className="text-[10px] text-muted -mt-1">Individual splat transparency</p>
-                  </div>
-                  <div className="space-y-1">
-                    <Slider label="Splat Size" value={settings.splatSize} min={0.5} max={2} step={0.05} onChange={(v) => updateSetting("splatSize", v)} unit="x" />
-                    <p className="text-[10px] text-muted -mt-1">Scale of individual splats</p>
-                  </div>
-                  <div className="space-y-1">
-                    <Slider label="Alpha Threshold" value={settings.splatThreshold} min={0} max={100} step={1} onChange={(v) => updateSetting("splatThreshold", v)} />
-                    <p className="text-[10px] text-muted -mt-1">Min alpha to render (lower = more visible)</p>
-                  </div>
-                  <div className="space-y-1">
-                    <Slider label="Render Distance" value={settings.splatRenderDistance} min={0.1} max={2} step={0.05} onChange={(v) => updateSetting("splatRenderDistance", v)} format={(v) => `${Math.round(v * 100)}%`} />
-                    <p className="text-[10px] text-muted -mt-1">Distance-based rendering multiplier</p>
-                  </div>
-                  <div className="space-y-1">
-                    <Slider label="Quality" value={settings.splatQuality} min={0.1} max={2} step={0.05} onChange={(v) => updateSetting("splatQuality", v)} format={(v) => `${Math.round(v * 100)}%`} />
-                    <p className="text-[10px] text-muted -mt-1">Overall rendering quality level</p>
-                  </div>
-                </Section>
-
-                <Section title="Material" defaultOpen={true}>
-                  <p className="text-xs text-muted">Material settings have been moved to Splat Controls above.</p>
                 </Section>
 
                 <Section title="Atmosphere" defaultOpen={true}>

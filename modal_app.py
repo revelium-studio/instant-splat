@@ -96,7 +96,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
     Pipeline:
     1. Save images to disk in the expected directory structure
     2. Run init_geo.py (MASt3R-based camera pose estimation + point cloud)
-    3. Run train.py (3D Gaussian Splatting training, 1000 iterations)
+    3. Run train.py (3D Gaussian Splatting training, 2000 iterations)
     4. Read the output PLY, trim if needed, and return
     """
     import io
@@ -171,10 +171,11 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
             s2 = data["scale_2"].astype(np.float64)
 
             # --- (a) Clamp absolute scale values ---
-            # exp(-7) ≈ 0.0009,  exp(1.0) ≈ 2.7
+            # exp(-7) ≈ 0.0009,  exp(1.5) ≈ 4.5
             # This prevents Gaussians from being extremely tiny or huge
+            # but allows enough range for proper scene coverage
             MIN_LOG_SCALE = -7.0
-            MAX_LOG_SCALE = 1.0
+            MAX_LOG_SCALE = 1.5
             s0 = np.clip(s0, MIN_LOG_SCALE, MAX_LOG_SCALE)
             s1 = np.clip(s1, MIN_LOG_SCALE, MAX_LOG_SCALE)
             s2 = np.clip(s2, MIN_LOG_SCALE, MAX_LOG_SCALE)
@@ -182,7 +183,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
             # --- (b) Clamp aspect ratio between axes ---
             # If the ratio between the largest and smallest scale exceeds
             # MAX_ASPECT_RATIO, shrink the largest towards the median.
-            MAX_ASPECT_RATIO_LOG = np.log(10.0)  # max 10:1 aspect ratio
+            MAX_ASPECT_RATIO_LOG = np.log(15.0)  # max 15:1 aspect ratio
             scales = np.stack([s0, s1, s2], axis=-1)  # (N, 3)
             s_min = scales.min(axis=-1)
             s_max = scales.max(axis=-1)
@@ -319,18 +320,18 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         # ------------------------------------------------------------------
         # 3) Train 3D Gaussian Splatting (1000 iterations)
         # ------------------------------------------------------------------
-        print("🔧 Step 2/2: Training 3D Gaussian Splatting (1000 iterations)...")
+        print("🔧 Step 2/2: Training 3D Gaussian Splatting (2000 iterations)...")
         train_cmd = [
             sys.executable, "/opt/instantsplat/train.py",
             "-s", str(source_path),
             "-m", str(model_path),
             "-r", "1",
             "--n_views", str(n_views),
-            "--iterations", "1000",
+            "--iterations", "2000",
             "--pp_optimizer",
             "--optim_pose",
             "--sh_degree", "0",           # DC-only → compact PLY
-            "--save_iterations", "1000",
+            "--save_iterations", "2000",
         ]
 
         train_result = subprocess.run(
@@ -353,7 +354,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         # ------------------------------------------------------------------
         # 4) Read and return the output PLY
         # ------------------------------------------------------------------
-        ply_path = model_path / "point_cloud" / "iteration_1000" / "point_cloud.ply"
+        ply_path = model_path / "point_cloud" / "iteration_2000" / "point_cloud.ply"
 
         if not ply_path.exists():
             # Search for any PLY file in the output tree
