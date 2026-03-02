@@ -96,7 +96,7 @@ export default function ProcessingStep({
           alt="Revelium Studio"
           className="h-4 sm:h-10 mx-auto mb-3 sm:mb-4 w-auto"
         />
-        <p className="text-muted text-base sm:text-lg font-medium">AnySplat</p>
+        <p className="text-muted text-base sm:text-lg font-medium">InstantSplat++</p>
       </header>
 
       {/* Main Content */}

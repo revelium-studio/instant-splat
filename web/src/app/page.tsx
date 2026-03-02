@@ -280,7 +280,7 @@ export default function Home() {
       formData.append("image", uploadedImage);
     }
 
-    console.log(`🚀 Starting AnySplat processing with ${uploadedImages.length} image(s)...`);
+    console.log(`🚀 Starting InstantSplat++ processing with ${uploadedImages.length} image(s)...`);
 
     try {
       console.log("Submitting image for processing...");

@@ -24,11 +24,11 @@ function corsResponse(response: NextResponse): NextResponse {
 // Check if running on Vercel
 const IS_VERCEL = process.env.VERCEL === "1";
 
-// Modal configuration for GPU processing (replacing RunPod)
-// Single AnySplat router endpoint (handles process + status)
+// Modal configuration for GPU processing
+// Single InstantSplat++ router endpoint (handles process + status)
 const MODAL_ENDPOINT =
   process.env.MODAL_ENDPOINT ||
-  "https://revelium-studio--anysplat-anysplat-router.modal.run";
+  "https://revelium-studio--instantplus-instantplus-router.modal.run";
 
 // Paths for local development
 const PROJECT_ROOT = path.resolve(process.cwd(), "..");
@@ -67,7 +67,7 @@ async function processWithModal(
   prompt: string = "",
   elevation: number = 20
 ): Promise<{ callId: string } | { plyBase64: string }> {
-  console.log(`🚀 Sending ${images.length} image(s) to Modal AnySplat router endpoint...`);
+  console.log(`🚀 Sending ${images.length} image(s) to Modal InstantSplat++ router endpoint...`);
   console.log(`📍 Modal endpoint: ${MODAL_ENDPOINT}`);
 
   // Build the request body.  If only one image, use backward-compatible
@@ -134,7 +134,7 @@ function processLocally(
   const venvActivate = path.join(PROJECT_ROOT, ".venv", "bin", "activate");
 
   // Note: Local 3D processing requires the full setup
-  // This is a placeholder - for local dev, you might want to use Modal AnySplat directly
+  // This is a placeholder - for local dev, you might want to use Modal InstantSplat++ directly
   const child = spawn(
     "bash",
     [
@@ -227,7 +227,7 @@ export async function POST(request: NextRequest) {
       return corsResponse(NextResponse.json({ error: "No image provided" }, { status: 400 }));
     }
 
-    console.log(`🚀 Starting Modal AnySplat processing with ${files.length} image(s)...`);
+    console.log(`🚀 Starting Modal InstantSplat++ processing with ${files.length} image(s)...`);
 
     // Convert all files to base64
     const images: Array<{ base64: string; filename: string }> = [];
@@ -281,10 +281,10 @@ export async function GET(request: NextRequest) {
     return corsResponse(NextResponse.json({ error: "No jobId provided" }, { status: 400 }));
   }
 
-  // For Modal AnySplat router, we always POST to the same endpoint for status
+  // For Modal InstantSplat++ router, we always POST to the same endpoint for status
   if (IS_VERCEL || jobId.startsWith("fc-")) {
     try {
-      console.log(`🔍 Polling Modal AnySplat router status for call_id: ${jobId}`);
+      console.log(`🔍 Polling Modal InstantSplat++ router status for call_id: ${jobId}`);
 
       const response = await fetch(MODAL_ENDPOINT, {
         method: "POST",
@@ -298,12 +298,12 @@ export async function GET(request: NextRequest) {
         signal: AbortSignal.timeout(30000), // 30 second timeout
       });
 
-      console.log(`📍 Modal AnySplat router status response: ${response.status}`);
+      console.log(`📍 Modal InstantSplat++ router status response: ${response.status}`);
 
       if (!response.ok) {
         const errorText = await response.text();
         console.error(
-          `❌ Modal AnySplat status check failed: ${response.status} - ${errorText}`
+          `❌ Modal InstantSplat++ status check failed: ${response.status} - ${errorText}`
         );
 
         // Return processing status as fallback
@@ -317,10 +317,10 @@ export async function GET(request: NextRequest) {
       }
 
       const modalStatus = await response.json();
-      console.log(`📊 Modal AnySplat status response:`, JSON.stringify(modalStatus, null, 2));
+      console.log(`📊 Modal InstantSplat++ status response:`, JSON.stringify(modalStatus, null, 2));
 
       if (modalStatus.status === "completed") {
-        console.log(`✅ Modal AnySplat job completed`);
+        console.log(`✅ Modal InstantSplat++ job completed`);
         return corsResponse(
           NextResponse.json({
             status: "completed",
@@ -330,7 +330,7 @@ export async function GET(request: NextRequest) {
           })
         );
       } else if (modalStatus.status === "failed") {
-        console.error(`❌ Modal AnySplat job failed:`, modalStatus.error);
+        console.error(`❌ Modal InstantSplat++ job failed:`, modalStatus.error);
         return corsResponse(
           NextResponse.json({
             status: "failed",
@@ -341,7 +341,7 @@ export async function GET(request: NextRequest) {
         );
       } else {
         // Still processing
-        console.log(`⏳ Modal AnySplat job still processing`);
+        console.log(`⏳ Modal InstantSplat++ job still processing`);
         return corsResponse(
           NextResponse.json({
             status: "processing",
@@ -352,7 +352,7 @@ export async function GET(request: NextRequest) {
         );
       }
     } catch (error) {
-      console.error("❌ Error polling Modal AnySplat router status:", error);
+      console.error("❌ Error polling Modal InstantSplat++ router status:", error);
       // If Modal API fails, assume still processing
       return corsResponse(
         NextResponse.json({

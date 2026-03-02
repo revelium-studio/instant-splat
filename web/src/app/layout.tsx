@@ -3,8 +3,8 @@ import AnalyticsWrapper from "@/components/AnalyticsWrapper";
 import "./globals.css";
 
 export const metadata: Metadata = {
-  title: "Revelium Studio | AnySplat",
-  description: "Transform any photograph into an explorable 3D scene",
+  title: "Revelium Studio | InstantSplat++",
+  description: "Transform any photograph into an explorable 3D scene with InstantSplat++",
   icons: {
     icon: [
       {
