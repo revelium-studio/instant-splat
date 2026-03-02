@@ -48,11 +48,10 @@ image = (
         #    gsplat etc. will now be compiled / resolved against torch 2.2.0+cu121.
         "pip install --no-cache-dir -r /opt/anysplat/requirements.txt",
 
-        # ── Phase 3: FORCE re-pin torch in case requirements.txt pulled a
-        #    different (CPU-only) version or xformers dragged in a mismatch.
-        "pip install --no-cache-dir --force-reinstall "
-        "torch==2.2.0+cu121 torchvision==0.17.0+cu121 torchaudio==2.2.0+cu121 "
-        "--index-url https://download.pytorch.org/whl/cu121",
+        # ── Phase 3 (removed): Do NOT force-reinstall torch after requirements.txt.
+        #    requirements.txt does not overwrite torch, and force-reinstalling would
+        #    replace the NVIDIA CUDA shared libraries that gsplat was linked against,
+        #    causing "Not compiled with CUDA support" at runtime.
 
         # ── Phase 4: NUCLEAR FIX for OpenCV (NVIDIA base image conflict)
         "pip uninstall -y opencv-python opencv-python-headless "
@@ -64,11 +63,11 @@ image = (
         # ── Phase 5: Pin numpy < 2 (must be LAST to override any 2.x)
         "pip install --no-cache-dir 'numpy<2'",
 
-        # ── Phase 6: Verify torch sees CUDA at import time (no GPU needed)
+        # ── Phase 6: Verify torch sees CUDA and gsplat imports cleanly
         'python -c "import torch; '
-        "print(f'torch={torch.__version__}  cuda={torch.version.cuda}  "
-        "backends.cudnn={torch.backends.cudnn.is_available()}'); "
-        "assert torch.version.cuda is not None, 'torch has NO CUDA support!'\"",
+        "print(f'torch={torch.__version__}  cuda={torch.version.cuda}  cudnn={torch.backends.cudnn.is_available()}'); "
+        "assert torch.version.cuda is not None, 'torch has NO CUDA support!'; "
+        "import gsplat; print(f'gsplat={gsplat.__version__}')\"",
     )
 )
 
@@ -132,9 +131,11 @@ def process_image(image_bytes: bytes, filename: str, prompt: str = "", elevation
 
         print(f"🔄 Starting AnySplat processing for {filename} ({len(image_bytes)} bytes)...")
 
-        # AnySplat expects a set of views; we feed a single-view sequence.
+        # AnySplat requires at least 2 views.  When we only have one image we
+        # duplicate it (exactly like the official HuggingFace Space does).
         img_tensor = preprocess_image(str(input_path))
-        images = torch.stack([img_tensor], dim=0).unsqueeze(0).to(device)  # [1, K=1, 3, 448, 448]
+        views = [img_tensor, img_tensor]  # duplicate for 2-view minimum
+        images = torch.stack(views, dim=0).unsqueeze(0).to(device)  # [1, K=2, 3, 448, 448]
         b, v, _, h, w = images.shape
         print(f"📐 AnySplat input tensor shape: {images.shape} (batch={b}, views={v}, H={h}, W={w})")
 
