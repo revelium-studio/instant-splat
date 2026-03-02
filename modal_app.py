@@ -142,41 +142,103 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         return views
 
     # -----------------------------------------------------------
-    # Helper: trim PLY by removing low-opacity Gaussians
+    # Helper: clean up Gaussian scales to prevent stretched splats
     # -----------------------------------------------------------
-    def trim_ply_if_needed(ply_path: Path, max_size_mb: float = 4.0) -> bytes:
-        """Read a PLY; if it exceeds max_size_mb, keep only highest-opacity splats."""
-        raw = ply_path.read_bytes()
-        size_mb = len(raw) / (1024 * 1024)
-
-        if size_mb <= max_size_mb:
-            return raw
-
+    def clean_gaussian_ply(ply_path: Path, max_size_mb: float = 4.0) -> bytes:
+        """
+        Post-process the PLY to fix stretched/degenerate Gaussians:
+        1. Clamp extreme scale values (prevents needle-like splats)
+        2. Clamp aspect ratios between axes
+        3. Remove very low-opacity Gaussians
+        4. Trim to max_size_mb if necessary
+        """
         from plyfile import PlyData, PlyElement
 
         ply = PlyData.read(str(ply_path))
         verts = ply["vertex"]
-        n = len(verts.data)
+        data = np.copy(verts.data)
+        n_original = len(data)
 
-        # Estimate bytes per vertex from the raw file
+        # Check which scale/opacity properties exist
+        prop_names = [p.name for p in verts.properties]
+        has_scales = all(f"scale_{i}" in prop_names for i in range(3))
+        has_opacity = "opacity" in prop_names
+
+        if has_scales:
+            # Scales are stored in log-space: actual_scale = exp(scale_i)
+            s0 = data["scale_0"].astype(np.float64)
+            s1 = data["scale_1"].astype(np.float64)
+            s2 = data["scale_2"].astype(np.float64)
+
+            # --- (a) Clamp absolute scale values ---
+            # exp(-7) ≈ 0.0009,  exp(1.0) ≈ 2.7
+            # This prevents Gaussians from being extremely tiny or huge
+            MIN_LOG_SCALE = -7.0
+            MAX_LOG_SCALE = 1.0
+            s0 = np.clip(s0, MIN_LOG_SCALE, MAX_LOG_SCALE)
+            s1 = np.clip(s1, MIN_LOG_SCALE, MAX_LOG_SCALE)
+            s2 = np.clip(s2, MIN_LOG_SCALE, MAX_LOG_SCALE)
+
+            # --- (b) Clamp aspect ratio between axes ---
+            # If the ratio between the largest and smallest scale exceeds
+            # MAX_ASPECT_RATIO, shrink the largest towards the median.
+            MAX_ASPECT_RATIO_LOG = np.log(10.0)  # max 10:1 aspect ratio
+            scales = np.stack([s0, s1, s2], axis=-1)  # (N, 3)
+            s_min = scales.min(axis=-1)
+            s_max = scales.max(axis=-1)
+            spread = s_max - s_min  # log-space difference = log(ratio)
+            stretched = spread > MAX_ASPECT_RATIO_LOG
+
+            if np.any(stretched):
+                s_median = np.median(scales, axis=-1)
+                # For stretched Gaussians, pull extreme axes towards median
+                for i, si in enumerate([s0, s1, s2]):
+                    too_big = stretched & (si == s_max)
+                    too_small = stretched & (si == s_min)
+                    si[too_big] = s_median[too_big] + MAX_ASPECT_RATIO_LOG / 2
+                    si[too_small] = s_median[too_small] - MAX_ASPECT_RATIO_LOG / 2
+                n_fixed = int(np.sum(stretched))
+                print(f"🔧 Fixed aspect ratio on {n_fixed:,} / {n_original:,} Gaussians")
+
+            data["scale_0"] = s0.astype(np.float32)
+            data["scale_1"] = s1.astype(np.float32)
+            data["scale_2"] = s2.astype(np.float32)
+
+        # --- (c) Remove very low-opacity Gaussians ---
+        if has_opacity:
+            # opacity is stored as logit: real_opacity = sigmoid(opacity)
+            opacities_logit = data["opacity"].astype(np.float64)
+            real_opacity = 1.0 / (1.0 + np.exp(-opacities_logit))
+            keep_mask = real_opacity > 0.005  # Remove nearly invisible splats
+            n_removed = int(np.sum(~keep_mask))
+            if n_removed > 0:
+                data = data[keep_mask]
+                print(f"🗑️  Removed {n_removed:,} near-invisible Gaussians (opacity < 0.5%)")
+
+        n_after_clean = len(data)
+        print(f"📊 Gaussians after cleanup: {n_after_clean:,} (was {n_original:,})")
+
+        # --- (d) Trim to max_size_mb if needed ---
+        # Estimate bytes per vertex
+        raw = ply_path.read_bytes()
         header_size = raw.index(b"end_header") + len(b"end_header\n")
         data_size = len(raw) - header_size
-        bytes_per_vert = data_size / n if n > 0 else 68
+        bytes_per_vert = data_size / n_original if n_original > 0 else 68
+        estimated_size_mb = (header_size + len(data) * bytes_per_vert) / (1024 * 1024)
 
-        max_verts = int((max_size_mb * 1024 * 1024 - header_size - 100) / bytes_per_vert)
-        max_verts = min(max_verts, n)
+        if estimated_size_mb > max_size_mb and has_opacity:
+            max_verts = int((max_size_mb * 1024 * 1024 - header_size - 100) / bytes_per_vert)
+            max_verts = min(max_verts, len(data))
+            opacities_logit = data["opacity"].astype(np.float64)
+            top_indices = np.argsort(opacities_logit)[::-1][:max_verts]
+            top_indices = np.sort(top_indices)
+            data = data[top_indices]
+            print(f"⚠️  Trimming PLY: {n_after_clean:,} → {len(data):,} vertices "
+                  f"({estimated_size_mb:.1f} MB → ~{max_size_mb} MB)")
 
-        print(f"⚠️  Trimming PLY: {n:,} → {max_verts:,} vertices ({size_mb:.1f} MB → ~{max_size_mb} MB)")
-
-        # Sort by opacity (descending) and keep the best ones
-        opacities = np.array(verts["opacity"])
-        top_indices = np.argsort(opacities)[::-1][:max_verts]
-        top_indices = np.sort(top_indices)
-
-        new_data = verts.data[top_indices]
-        new_elem = PlyElement.describe(new_data, "vertex")
+        # Write cleaned PLY
+        new_elem = PlyElement.describe(data, "vertex")
         new_ply = PlyData([new_elem], text=False)
-
         buf = io.BytesIO()
         new_ply.write(buf)
         return buf.getvalue()
@@ -310,7 +372,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         raw_size_mb = ply_path.stat().st_size / (1024 * 1024)
         print(f"📦 Raw PLY: {ply_path.stat().st_size:,} bytes ({raw_size_mb:.1f} MB)")
 
-        ply_bytes = trim_ply_if_needed(ply_path, max_size_mb=4.0)
+        ply_bytes = clean_gaussian_ply(ply_path, max_size_mb=4.0)
 
         final_size_mb = len(ply_bytes) / (1024 * 1024)
         print(

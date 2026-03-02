@@ -369,31 +369,8 @@ function Select({
   );
 }
 
-interface ExtendedViewer {
-  dispose?: () => void;
-  camera?: {
-    fov: number;
-    near: number;
-    far: number;
-    updateProjectionMatrix: () => void;
-  };
-  controls?: {
-    enablePan: boolean;
-    panSpeed: number;
-    rotateSpeed: number;
-    zoomSpeed: number;
-    mouseButtons: { LEFT: number; MIDDLE: number; RIGHT: number };
-  };
-  renderer?: {
-    domElement: HTMLCanvasElement;
-    setClearColor: (color: number, alpha: number) => void;
-  };
-  splatMesh?: {
-    scale: { set: (x: number, y: number, z: number) => void };
-    rotation: { set: (x: number, y: number, z: number) => void };
-    position: { set: (x: number, y: number, z: number) => void };
-  };
-}
+// eslint-disable-next-line @typescript-eslint/no-explicit-any
+type GS3DViewer = any; // The real GaussianSplats3D.Viewer - we use 'any' to access internal properties
 
 export default function ViewerStep({ result, onBack }: ViewerStepProps) {
   const containerRef = useRef<HTMLDivElement>(null);
@@ -405,7 +382,7 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
   // Sidebar: collapsed by default on mobile, open by default on desktop
   const [showSettings, setShowSettings] = useState(false);
   const [isMobile, setIsMobile] = useState(false);
-  const viewerInstanceRef = useRef<ExtendedViewer | null>(null);
+  const viewerInstanceRef = useRef<GS3DViewer | null>(null);
   const blobUrlRef = useRef<string | null>(null);
   const grainAnimationRef = useRef<number | null>(null);
   const [isEnhancing, setIsEnhancing] = useState(false);
@@ -576,29 +553,32 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
     }
   }, [getCSSFilters, settings.splatOpacity, settings.blendMode, settings.pixelate]);
 
-  // Camera settings
+  // Camera settings — the GS3D viewer exposes a Three.js PerspectiveCamera
   useEffect(() => {
     const viewer = viewerInstanceRef.current;
-    if (viewer?.camera) {
-      viewer.camera.fov = settings.fov;
-      viewer.camera.near = settings.nearClip;
-      viewer.camera.far = settings.farClip;
-      viewer.camera.updateProjectionMatrix();
+    const camera = viewer?.camera || viewer?.perspectiveCamera;
+    if (camera) {
+      camera.fov = settings.fov;
+      camera.near = settings.nearClip;
+      camera.far = settings.farClip;
+      camera.updateProjectionMatrix?.();
     }
   }, [settings.fov, settings.nearClip, settings.farClip]);
 
-  // Splat controls
+  // Splat controls — apply via the real GS3D API where possible
   useEffect(() => {
     const viewer = viewerInstanceRef.current;
-    if (viewer?.splatMesh) {
-      // Apply size with density multiplier
-      const scale = settings.splatSize * settings.splatDensity;
+    
+    // Apply scene scale via splatMesh (Three.js Object3D)
+    if (viewer?.splatMesh?.scale) {
+      const scale = settings.splatSize;
       viewer.splatMesh.scale.set(scale, scale, scale);
     }
     
-    // Apply opacity with density
+    // Apply opacity via CSS (the GS3D library doesn't expose per-splat opacity at runtime
+    // unless enableOptionalEffects is used; CSS opacity is the reliable fallback)
     if (canvasRef.current) {
-      const effectiveOpacity = settings.splatOpacity * settings.splatDensity;
+      const effectiveOpacity = settings.splatOpacity * Math.min(settings.splatDensity, 1);
       canvasRef.current.style.opacity = String(Math.min(effectiveOpacity, 1));
     }
   }, [settings.splatSize, settings.splatDensity, settings.splatOpacity]);
@@ -606,9 +586,10 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
   // Background color
   useEffect(() => {
     const viewer = viewerInstanceRef.current;
-    if (viewer?.renderer) {
+    const renderer = viewer?.renderer;
+    if (renderer) {
       const color = parseInt(settings.bgColor.replace("#", ""), 16);
-      viewer.renderer.setClearColor(color, 1);
+      renderer.setClearColor?.(color, 1);
     }
   }, [settings.bgColor]);
 
@@ -637,7 +618,7 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
           rootElement: containerRef.current,
           selfDrivenMode: true,
           useBuiltInControls: true,
-          dynamicScene: false,
+          dynamicScene: true,  // Allow runtime scale/position changes on splatMesh
           sharedMemoryForWorkers: false,
           antialiased: false,
           logLevel: GaussianSplats3D.LogLevel.None,
@@ -645,9 +626,12 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
           sphericalHarmonicsDegree: 0,
           integerBasedSort: true,
           halfPrecisionCovariancesOnGPU: true,
+          enableOptionalEffects: true,   // Allow runtime opacity & effects
+          focalAdjustment: 1.0,          // Controls apparent splat size
+          kernel2DSize: 0.3,             // 2D screen-space kernel constant
         });
 
-        viewerInstanceRef.current = viewer as unknown as ExtendedViewer;
+        viewerInstanceRef.current = viewer;
 
         let splatPath: string;
 
@@ -680,48 +664,37 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
 
         viewer.start();
 
-        const extViewer = viewerInstanceRef.current;
-        if (extViewer?.controls) {
+        // Access internal properties of the GS3D viewer
+        const gViewer = viewerInstanceRef.current;
+        if (gViewer?.controls) {
           // Detect mobile device
-          const isMobile = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || 
+          const isMobileDevice = /iPhone|iPad|iPod|Android/i.test(navigator.userAgent) || 
                           (typeof window !== 'undefined' && window.innerWidth < 768);
           
-          extViewer.controls.enablePan = true;
-          extViewer.controls.panSpeed = isMobile ? 0.8 : 1.5;
-          // Reduce rotation speed on mobile for smoother, more controlled rotation
-          extViewer.controls.rotateSpeed = isMobile ? 0.35 : 1.0;
-          extViewer.controls.zoomSpeed = isMobile ? 0.8 : 1.2;
-          extViewer.controls.mouseButtons = { LEFT: 0, MIDDLE: 2, RIGHT: 1 };
+          gViewer.controls.enablePan = true;
+          gViewer.controls.panSpeed = isMobileDevice ? 0.8 : 1.5;
+          gViewer.controls.rotateSpeed = isMobileDevice ? 0.35 : 1.0;
+          gViewer.controls.zoomSpeed = isMobileDevice ? 0.8 : 1.2;
+          gViewer.controls.mouseButtons = { LEFT: 0, MIDDLE: 2, RIGHT: 1 };
           
-          // Enable damping for smoother mobile interactions
-          if ('enableDamping' in extViewer.controls) {
-            (extViewer.controls as any).enableDamping = true;
-            (extViewer.controls as any).dampingFactor = isMobile ? 0.2 : 0.05;
+          if ('enableDamping' in gViewer.controls) {
+            gViewer.controls.enableDamping = true;
+            gViewer.controls.dampingFactor = isMobileDevice ? 0.2 : 0.05;
           }
           
-          // Add touch event handling for better mobile rotation anchor
+          // Touch event handling for mobile
           let touchCleanup: (() => void) | null = null;
-          if (isMobile && extViewer.renderer?.domElement) {
-            const canvas = extViewer.renderer.domElement;
-            let touchStartX = 0;
-            let touchStartY = 0;
+          if (isMobileDevice && gViewer.renderer?.domElement) {
+            const canvas = gViewer.renderer.domElement;
             let isRotating = false;
             
             const handleTouchStart = (e: TouchEvent) => {
               if (e.touches.length === 1) {
-                const touch = e.touches[0];
-                touchStartX = touch.clientX;
-                touchStartY = touch.clientY;
                 isRotating = true;
-                
-                // Set rotation center to touch point (convert screen to world coordinates)
                 const rect = canvas.getBoundingClientRect();
-                const x = ((touch.clientX - rect.left) / rect.width) * 2 - 1;
-                
-                // Update controls target based on touch point for better rotation anchor
-                if (extViewer.controls) {
-                  // Adjust sensitivity based on touch position for smoother rotation
-                  extViewer.controls.rotateSpeed = 0.35 * (1 + Math.abs(x) * 0.2);
+                const x = ((e.touches[0].clientX - rect.left) / rect.width) * 2 - 1;
+                if (gViewer.controls) {
+                  gViewer.controls.rotateSpeed = 0.35 * (1 + Math.abs(x) * 0.2);
                 }
               }
             };
@@ -729,16 +702,13 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
             const handleTouchMove = (e: TouchEvent) => {
               if (e.touches.length === 1 && isRotating) {
                 e.preventDefault();
-                const touch = e.touches[0];
-                touchStartX = touch.clientX;
-                touchStartY = touch.clientY;
               }
             };
             
             const handleTouchEnd = () => {
               isRotating = false;
-              if (extViewer.controls) {
-                extViewer.controls.rotateSpeed = 0.35; // Reset to base mobile speed
+              if (gViewer.controls) {
+                gViewer.controls.rotateSpeed = 0.35;
               }
             };
             
@@ -755,20 +725,20 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
             };
           }
           
-          // Store cleanup for later
           if (touchCleanup) {
-            // We'll call this in the main useEffect cleanup
-            (viewerInstanceRef.current as any).__touchCleanup = touchCleanup;
+            gViewer.__touchCleanup = touchCleanup;
           }
         }
 
-        if (extViewer?.renderer?.domElement) {
-          canvasRef.current = extViewer.renderer.domElement;
+        // Get the canvas for CSS-based effects
+        if (gViewer?.renderer?.domElement) {
+          canvasRef.current = gViewer.renderer.domElement;
         }
 
-        if (extViewer?.renderer) {
+        // Set background color
+        if (gViewer?.renderer) {
           const color = parseInt(settings.bgColor.replace("#", ""), 16);
-          extViewer.renderer.setClearColor(color, 1);
+          gViewer.renderer.setClearColor(color, 1);
         }
 
         if (mounted) setIsLoading(false);
@@ -788,9 +758,8 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
       clearTimeout(timer);
       if (viewerInstanceRef.current) {
         try {
-          // Cleanup touch event listeners
-          if ((viewerInstanceRef.current as any).__touchCleanup) {
-            (viewerInstanceRef.current as any).__touchCleanup();
+          if (viewerInstanceRef.current.__touchCleanup) {
+            viewerInstanceRef.current.__touchCleanup();
           }
           if (typeof viewerInstanceRef.current.dispose === "function") {
             viewerInstanceRef.current.dispose();
@@ -1233,7 +1202,7 @@ export default function ViewerStep({ result, onBack }: ViewerStepProps) {
                   <div className="grid grid-cols-2 gap-x-4 gap-y-1 text-xs">
                     <div className="flex justify-between">
                       <span className="text-muted">Splats</span>
-                      <span className="text-foreground">~1.2M</span>
+                      <span className="text-foreground">{result.plyBase64 ? `~${Math.round(atob(result.plyBase64).length / 250 / 1000)}K` : "—"}</span>
                     </div>
                     <div className="flex justify-between">
                       <span className="text-muted">Format</span>

@@ -13,6 +13,11 @@ declare module "@mkkellogg/gaussian-splats-3d" {
     Ksplat = 2,
   }
 
+  export enum SplatRenderMode {
+    ThreeD = 0,
+    TwoD = 1,
+  }
+
   export interface ViewerOptions {
     cameraUp?: [number, number, number];
     initialCameraPosition?: [number, number, number];
@@ -28,6 +33,14 @@ declare module "@mkkellogg/gaussian-splats-3d" {
     sphericalHarmonicsDegree?: number;
     integerBasedSort?: boolean;
     halfPrecisionCovariancesOnGPU?: boolean;
+    enableOptionalEffects?: boolean;
+    focalAdjustment?: number;
+    kernel2DSize?: number;
+    splatRenderMode?: SplatRenderMode;
+    gpuAcceleratedSort?: boolean;
+    enableSIMDInSort?: boolean;
+    ignoreDevicePixelRatio?: boolean;
+    [key: string]: unknown; // Allow additional properties
   }
 
   export interface SplatSceneOptions {
@@ -35,6 +48,9 @@ declare module "@mkkellogg/gaussian-splats-3d" {
     showLoadingUI?: boolean;
     progressiveLoad?: boolean;
     format?: SceneFormat;
+    position?: [number, number, number];
+    rotation?: [number, number, number, number];
+    scale?: [number, number, number];
     onProgress?: (progress: number, message?: string) => void;
   }
 
@@ -44,10 +60,14 @@ declare module "@mkkellogg/gaussian-splats-3d" {
     start(): void;
     stop(): void;
     dispose(): void;
-    setCamera?(
-      position: [number, number, number],
-      lookAt: [number, number, number],
-      up: [number, number, number]
-    ): void;
+    update(): void;
+    render(): void;
+    // Internal properties accessible at runtime
+    camera?: unknown;
+    perspectiveCamera?: unknown;
+    renderer?: unknown;
+    controls?: unknown;
+    splatMesh?: unknown;
+    [key: string]: unknown;
   }
 }
