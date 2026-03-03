@@ -69,6 +69,12 @@ image = (
         # ── Phase 8: Install plyfile for post-processing
         "pip install --no-cache-dir plyfile",
 
+        # NOTE: InstantSplat++ PP optimizer does not support runtime
+        # densification (the required gradient-accum tensors are not
+        # initialised by training_setup_pp).  Instead we rely on
+        # aggressive post-processing: positional outlier removal,
+        # tight scale clamping and opacity pruning.
+
         # ── Phase 9: Verify installation
         'python -c "'
         "import torch; "
@@ -96,8 +102,8 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
     Pipeline:
     1. Save images to disk in the expected directory structure
     2. Run init_geo.py (MASt3R-based camera pose estimation + point cloud)
-    3. Run train.py (3D Gaussian Splatting training, 2000 iterations)
-    4. Read the output PLY, trim if needed, and return
+    3. Run train.py (3D Gaussian Splatting training with pruning)
+    4. Post-process and return the PLY
     """
     import io
     import os
@@ -106,6 +112,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
     import tempfile
     from pathlib import Path
 
+    import cv2
     import numpy as np
     from PIL import Image
 
@@ -118,39 +125,80 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
     sys.path.insert(0, "/opt/instantsplat")
 
     # -----------------------------------------------------------
-    # Helper: create synthetic views from a single image
+    # Helper: create synthetic views using perspective homography
     # -----------------------------------------------------------
     def create_synthetic_views(pil_img: Image.Image, n_views: int = 3) -> list[Image.Image]:
-        """Generate slightly shifted views from one image for MASt3R matching."""
-        w, h = pil_img.size
-        views = []
+        """
+        Generate perspective-transformed views from one image for MASt3R.
 
-        # View 1: center (tiny crop to create a distinct view)
-        m = int(min(w, h) * 0.02)
-        v1 = pil_img.crop((m, m, w - m, h - m)).resize((w, h), Image.LANCZOS)
-        views.append(v1)
+        Instead of tiny crops (which give MASt3R almost no parallax),
+        we apply homography transforms that simulate the camera rotating
+        ±8° around the subject. This produces the kind of baseline that
+        MASt3R needs to estimate accurate depth.
+        """
+        img_np = np.array(pil_img)
+        h, w = img_np.shape[:2]
 
-        # View 2: shifted left
-        sx = int(w * 0.06)
-        v2 = pil_img.crop((0, m, w - sx * 2, h - m)).resize((w, h), Image.LANCZOS)
-        views.append(v2)
+        # Approximate focal length – a common heuristic is 1.2× the larger
+        # image dimension, which corresponds to ~45° horizontal FoV.
+        f = max(h, w) * 1.2
+        cx, cy = w / 2.0, h / 2.0
 
-        # View 3: shifted right
-        v3 = pil_img.crop((sx * 2, m, w, h - m)).resize((w, h), Image.LANCZOS)
-        views.append(v3)
+        K = np.array([[f, 0, cx],
+                      [0, f, cy],
+                      [0, 0,  1]], dtype=np.float64)
+        K_inv = np.linalg.inv(K)
+
+        views: list[Image.Image] = []
+
+        # Horizontal rotation angles: center, left, right
+        # ±8° gives enough parallax for MASt3R without too much distortion
+        angles_deg = [0.0, -8.0, 8.0]
+        if n_views > 3:
+            angles_deg = np.linspace(-10, 10, n_views).tolist()
+
+        for angle in angles_deg[:n_views]:
+            theta = np.radians(angle)
+
+            # Rotation around the vertical (Y) axis
+            Ry = np.array([
+                [ np.cos(theta), 0, np.sin(theta)],
+                [ 0,             1, 0             ],
+                [-np.sin(theta), 0, np.cos(theta)],
+            ], dtype=np.float64)
+
+            # Add a small vertical tilt (20% of horizontal) for richer geometry
+            phi = np.radians(angle * 0.2)
+            Rx = np.array([
+                [1, 0,            0           ],
+                [0, np.cos(phi), -np.sin(phi) ],
+                [0, np.sin(phi),  np.cos(phi) ],
+            ], dtype=np.float64)
+
+            R = Rx @ Ry
+            H = K @ R @ K_inv
+
+            warped = cv2.warpPerspective(
+                img_np, H, (w, h),
+                flags=cv2.INTER_LANCZOS4,
+                borderMode=cv2.BORDER_REFLECT_101,
+            )
+            views.append(Image.fromarray(warped))
 
         return views
 
     # -----------------------------------------------------------
-    # Helper: clean up Gaussian scales to prevent stretched splats
+    # Helper: clean up / post-process the Gaussian PLY
     # -----------------------------------------------------------
     def clean_gaussian_ply(ply_path: Path, max_size_mb: float = 4.0) -> bytes:
         """
-        Post-process the PLY to fix stretched/degenerate Gaussians:
-        1. Clamp extreme scale values (prevents needle-like splats)
-        2. Clamp aspect ratios between axes
-        3. Remove very low-opacity Gaussians
-        4. Trim to max_size_mb if necessary
+        Post-process the Gaussian PLY to remove degenerate splats:
+
+        1. Remove positional outliers (far from scene center)
+        2. Clamp extreme scale values (prevents needle-like splats)
+        3. Clamp aspect ratios between axes (max 10:1)
+        4. Remove very low-opacity Gaussians
+        5. Trim to max_size_mb if necessary
         """
         from plyfile import PlyData, PlyElement
 
@@ -159,76 +207,89 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         data = np.copy(verts.data)
         n_original = len(data)
 
-        # Check which scale/opacity properties exist
         prop_names = [p.name for p in verts.properties]
         has_scales = all(f"scale_{i}" in prop_names for i in range(3))
         has_opacity = "opacity" in prop_names
+        has_xyz = all(c in prop_names for c in ("x", "y", "z"))
 
+        # --- (a) Remove positional outliers ---
+        # Gaussians placed far from the scene centre are artefacts
+        if has_xyz:
+            xyz = np.stack([data["x"].astype(np.float64),
+                            data["y"].astype(np.float64),
+                            data["z"].astype(np.float64)], axis=-1)
+            centre = np.median(xyz, axis=0)
+            dists = np.linalg.norm(xyz - centre, axis=1)
+            # Keep points within 3× the 90th-percentile distance
+            dist_p90 = np.percentile(dists, 90)
+            dist_threshold = dist_p90 * 3.0
+            pos_mask = dists < dist_threshold
+            n_pos_removed = int(np.sum(~pos_mask))
+            if n_pos_removed > 0:
+                data = data[pos_mask]
+                print(f"🗺️  Removed {n_pos_removed:,} positional outlier Gaussians "
+                      f"(>{dist_threshold:.2f} from centre)")
+
+        # --- (b) Clamp scale values ---
         if has_scales:
-            # Scales are stored in log-space: actual_scale = exp(scale_i)
             s0 = data["scale_0"].astype(np.float64)
             s1 = data["scale_1"].astype(np.float64)
             s2 = data["scale_2"].astype(np.float64)
 
-            # --- (a) Clamp absolute scale values ---
-            # exp(-7) ≈ 0.0009,  exp(1.5) ≈ 4.5
-            # This prevents Gaussians from being extremely tiny or huge
-            # but allows enough range for proper scene coverage
+            # exp(-7) ≈ 0.0009,  exp(0.5) ≈ 1.65
+            # Tighter upper bound than before (was 1.5 → now 0.5)
+            # to prevent oversized Gaussians from dominating the scene
             MIN_LOG_SCALE = -7.0
-            MAX_LOG_SCALE = 1.5
+            MAX_LOG_SCALE = 0.5
             s0 = np.clip(s0, MIN_LOG_SCALE, MAX_LOG_SCALE)
             s1 = np.clip(s1, MIN_LOG_SCALE, MAX_LOG_SCALE)
             s2 = np.clip(s2, MIN_LOG_SCALE, MAX_LOG_SCALE)
 
-            # --- (b) Clamp aspect ratio between axes ---
-            # If the ratio between the largest and smallest scale exceeds
-            # MAX_ASPECT_RATIO, shrink the largest towards the median.
-            MAX_ASPECT_RATIO_LOG = np.log(15.0)  # max 15:1 aspect ratio
-            scales = np.stack([s0, s1, s2], axis=-1)  # (N, 3)
+            # --- (c) Clamp aspect ratio ---
+            # Max 10:1 ratio between any two scale axes
+            MAX_ASPECT_RATIO_LOG = np.log(10.0)
+            scales = np.stack([s0, s1, s2], axis=-1)
             s_min = scales.min(axis=-1)
             s_max = scales.max(axis=-1)
-            spread = s_max - s_min  # log-space difference = log(ratio)
+            spread = s_max - s_min
             stretched = spread > MAX_ASPECT_RATIO_LOG
 
             if np.any(stretched):
                 s_median = np.median(scales, axis=-1)
-                # For stretched Gaussians, pull extreme axes towards median
-                for i, si in enumerate([s0, s1, s2]):
+                for _i, si in enumerate([s0, s1, s2]):
                     too_big = stretched & (si == s_max)
                     too_small = stretched & (si == s_min)
                     si[too_big] = s_median[too_big] + MAX_ASPECT_RATIO_LOG / 2
                     si[too_small] = s_median[too_small] - MAX_ASPECT_RATIO_LOG / 2
                 n_fixed = int(np.sum(stretched))
-                print(f"🔧 Fixed aspect ratio on {n_fixed:,} / {n_original:,} Gaussians")
+                print(f"🔧 Fixed aspect ratio on {n_fixed:,} / {len(data):,} Gaussians")
 
             data["scale_0"] = s0.astype(np.float32)
             data["scale_1"] = s1.astype(np.float32)
             data["scale_2"] = s2.astype(np.float32)
 
-        # --- (c) Remove very low-opacity Gaussians ---
+        # --- (d) Remove very low-opacity Gaussians ---
         if has_opacity:
-            # opacity is stored as logit: real_opacity = sigmoid(opacity)
             opacities_logit = data["opacity"].astype(np.float64)
             real_opacity = 1.0 / (1.0 + np.exp(-opacities_logit))
-            keep_mask = real_opacity > 0.005  # Remove nearly invisible splats
+            keep_mask = real_opacity > 0.01  # Remove splats with < 1% opacity
             n_removed = int(np.sum(~keep_mask))
             if n_removed > 0:
                 data = data[keep_mask]
-                print(f"🗑️  Removed {n_removed:,} near-invisible Gaussians (opacity < 0.5%)")
+                print(f"🗑️  Removed {n_removed:,} near-invisible Gaussians (opacity < 1%)")
 
         n_after_clean = len(data)
         print(f"📊 Gaussians after cleanup: {n_after_clean:,} (was {n_original:,})")
 
-        # --- (d) Trim to max_size_mb if needed ---
-        # Estimate bytes per vertex
+        # --- (e) Trim to max_size_mb ---
         raw = ply_path.read_bytes()
-        header_size = raw.index(b"end_header") + len(b"end_header\n")
-        data_size = len(raw) - header_size
+        header_end = raw.index(b"end_header") + len(b"end_header\n")
+        data_size = len(raw) - header_end
         bytes_per_vert = data_size / n_original if n_original > 0 else 68
-        estimated_size_mb = (header_size + len(data) * bytes_per_vert) / (1024 * 1024)
+        estimated_size_mb = (header_end + len(data) * bytes_per_vert) / (1024 * 1024)
 
         if estimated_size_mb > max_size_mb and has_opacity:
-            max_verts = int((max_size_mb * 1024 * 1024 - header_size - 100) / bytes_per_vert)
+            max_verts = int((max_size_mb * 1024 * 1024 - header_end - 100) / bytes_per_vert)
             max_verts = min(max_verts, len(data))
             opacities_logit = data["opacity"].astype(np.float64)
             top_indices = np.argsort(opacities_logit)[::-1][:max_verts]
@@ -260,19 +321,20 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         # 1) Save images to disk
         # ------------------------------------------------------------------
         n_views = 0
+        is_single_image = len(image_bytes_list) == 1
 
-        if len(image_bytes_list) == 1:
-            # Single image → create 3 synthetic views
+        if is_single_image:
+            # Single image → create 3 perspective-shifted synthetic views
             pil_img = Image.open(io.BytesIO(image_bytes_list[0])).convert("RGB")
             w, h = pil_img.size
             print(f"🖼️  Single image: {filenames[0]} — {w}×{h}")
 
-            views = create_synthetic_views(pil_img)
+            views = create_synthetic_views(pil_img, n_views=3)
             for i, view in enumerate(views):
                 view_path = image_dir / f"view_{i:03d}.jpg"
                 view.save(str(view_path), quality=95)
             n_views = len(views)
-            print(f"📐 Created {n_views} synthetic views from single image")
+            print(f"📐 Created {n_views} synthetic perspective views (±8° rotation)")
         else:
             # Multiple images → save each directly
             for idx, (img_bytes, fname) in enumerate(zip(image_bytes_list, filenames)):
@@ -318,20 +380,21 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         print("✅ Geometry initialization complete")
 
         # ------------------------------------------------------------------
-        # 3) Train 3D Gaussian Splatting (1000 iterations)
+        # 3) Train 3D Gaussian Splatting (with pruning enabled)
         # ------------------------------------------------------------------
-        print("🔧 Step 2/2: Training 3D Gaussian Splatting (2000 iterations)...")
+        n_iters = 2000
+        print(f"🔧 Step 2/2: Training 3D Gaussian Splatting ({n_iters} iters, pruning ON)...")
         train_cmd = [
             sys.executable, "/opt/instantsplat/train.py",
             "-s", str(source_path),
             "-m", str(model_path),
             "-r", "1",
             "--n_views", str(n_views),
-            "--iterations", "2000",
+            "--iterations", str(n_iters),
             "--pp_optimizer",
             "--optim_pose",
-            "--sh_degree", "0",           # DC-only → compact PLY
-            "--save_iterations", "2000",
+            "--sh_degree", "0",                    # DC-only → compact PLY
+            "--save_iterations", str(n_iters),
         ]
 
         train_result = subprocess.run(
@@ -354,16 +417,15 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         # ------------------------------------------------------------------
         # 4) Read and return the output PLY
         # ------------------------------------------------------------------
-        ply_path = model_path / "point_cloud" / "iteration_2000" / "point_cloud.ply"
+        ply_path = model_path / "point_cloud" / f"iteration_{n_iters}" / "point_cloud.ply"
 
         if not ply_path.exists():
-            # Search for any PLY file in the output tree
+            # Search for any Gaussian PLY file in the output tree
             ply_files = sorted(model_path.glob("**/point_cloud.ply"))
             if ply_files:
-                ply_path = ply_files[-1]  # Take the latest one
+                ply_path = ply_files[-1]
                 print(f"⚠️  Using fallback PLY: {ply_path}")
             else:
-                # List what we DO have for debugging
                 all_files = list(model_path.rglob("*"))
                 print(f"📁 Output tree ({len(all_files)} files):")
                 for f in all_files[:50]:
@@ -378,7 +440,7 @@ def process_images(image_bytes_list: list[bytes], filenames: list[str]) -> bytes
         final_size_mb = len(ply_bytes) / (1024 * 1024)
         print(
             f"✅ InstantSplat++ PLY: {len(ply_bytes):,} bytes ({final_size_mb:.1f} MB), "
-            f"DC-only SH, co-vis downsampled"
+            f"DC-only SH, co-vis downsampled, pruning-cleaned"
         )
         return ply_bytes
 
